@@ -256,21 +256,35 @@ function decodeResult(probes, edges, reference, dinic, id, S, T, flow) {
  * @param {(() => boolean)|null} [shouldCancel] 协作式取消。
  */
 export function solve(input, shouldCancel = null) {
+  return solveTracked(input, shouldCancel).result;
+}
+
+/**
+ * 同步求解并保留同一次最大流后的完整现场（残量网络）。
+ * 归属审计必须复用该现场，禁止重新求解：
+ * @returns {{result:object, network:object|null}} result 失败/取消时 network 为 null。
+ */
+export function solveTracked(input, shouldCancel = null) {
   const errors = validateInput(input);
-  if (errors.length) return { ok: false, errors };
+  if (errors.length) return { result: { ok: false, errors }, network: null };
 
   const { probes, edges, reference } = input;
   const built = buildNetwork(probes, edges, reference);
   const flow = built.dinic.maxflow(built.S, built.T, shouldCancel);
-  if (shouldCancel && shouldCancel()) return { ok: false, canceled: true };
-  return decodeResult(probes, edges, reference, built.dinic, built.id, built.S, built.T, flow);
+  if (shouldCancel && shouldCancel()) return { result: { ok: false, canceled: true }, network: null };
+  const result = decodeResult(probes, edges, reference, built.dinic, built.id, built.S, built.T, flow);
+  const network = { probes, edges, reference, dinic: built.dinic, id: built.id, S: built.S, T: built.T, flow };
+  return { result, network };
 }
 
 /**
  * 异步主入口（Web Worker 使用）：计算途中周期性让出事件循环，
  * 使“取消 / 草稿已变更”能及时生效；返回 canceled 时调用方必须丢弃结果。
+ * @param {((network:object)=>void)|null} [onSolved]
+ *   成功后回调，交出同一次最大流的残量网络现场供归属审计复用；
+ *   校验失败/取消时绝不调用。
  */
-export async function solveAsync(input, shouldCancel = null, yieldEvery = 100000) {
+export async function solveAsync(input, shouldCancel = null, yieldEvery = 100000, onSolved = null) {
   const errors = validateInput(input);
   if (errors.length) return { ok: false, errors };
 
@@ -278,5 +292,269 @@ export async function solveAsync(input, shouldCancel = null, yieldEvery = 100000
   const built = buildNetwork(probes, edges, reference);
   const flow = await built.dinic.maxflowAsync(built.S, built.T, shouldCancel, yieldEvery);
   if (shouldCancel && shouldCancel()) return { ok: false, canceled: true };
-  return decodeResult(probes, edges, reference, built.dinic, built.id, built.S, built.T, flow);
+  const result = decodeResult(probes, edges, reference, built.dinic, built.id, built.S, built.T, flow);
+  if (onSolved) {
+    onSolved({ probes, edges, reference, dinic: built.dinic, id: built.id, S: built.S, T: built.T, flow });
+  }
+  return result;
+}
+
+/**
+ * 最优解归属审计：在【同一次】精确最小割完成后的残量网络上，求每个探针
+ * 在保持当前最小总代价时能够取到的完整整数相位区间。
+ *
+ * 方法（最小割格的强连通分量偏序，不逐探针重跑、不浮点近似、不枚举赋值）：
+ *   最大流后的残量网络（仅取残量容量 > 0 的弧）中，
+ *   - 彼此残量可达的节点属于同一强连通分量（SCC）；SCC 缩点得到一张
+ *     偏序 DAG（最小割格的可达序）；
+ *   - 阈值节点 (i,k)（在源侧 ⇔ z_{i,k}=1 ⇔ x_i≥k）：
+ *       · S 沿残量弧可达 ⇒ 在一切最小割中必在源侧（z 恒为 1）；
+ *       · 自身沿残量弧可达 T ⇒ 在一切最小割中必在汇侧（z 恒为 0）；
+ *       · 两者皆否 ⇒ 自由 SCC，可在偏序闭包约束内翻转取侧；
+ *   - 最小最小割 = S 的残量可达集（逐 z 最小，即字典序规范解），
+ *     给出每个探针的 min；
+ *   - 最大最小割 = 不能沿残量弧到达 T 的节点全集（最大闭包），
+ *     给出每个探针的 max。
+ *   阈值链的单调性保证投影为连续整数区间 [min, max]。
+ *
+ * @param {object} network solveTracked/onSolved 交出的同一次求解现场。
+ * @returns 审计表（含规范相位、最小/最大值、状态与自由 SCC 成员说明）。
+ */
+export function analyzeOptimalInterval(network) {
+  const { probes, edges, reference, dinic, id, S, T, flow } = network;
+  if (flow >= INF) throw new Error('审计内部错误：最小割截断了无限容量弧');
+
+  const n = dinic.n;
+
+  // ---- 1) 残量网络（仅残量容量 > 0 的弧）压缩为 CSR 正/反邻接 -------------
+  const off = new Int32Array(n + 1);
+  const indeg = new Int32Array(n);
+  for (let v = 0; v < n; v++) {
+    for (const e of dinic.g[v]) {
+      if (e[2] > 0) {
+        off[v + 1]++;
+        indeg[e[0]]++;
+      }
+    }
+  }
+  for (let v = 0; v < n; v++) off[v + 1] += off[v];
+  const roff = new Int32Array(n + 1);
+  for (let v = 0; v < n; v++) roff[v + 1] = roff[v] + indeg[v];
+  const m = off[n];
+  const to = new Int32Array(m);
+  const rto = new Int32Array(m);
+  const fp = off.slice(0, n);
+  const rp = roff.slice(0, n);
+  for (let v = 0; v < n; v++) {
+    for (const e of dinic.g[v]) {
+      if (e[2] <= 0) continue;
+      const w = e[0];
+      to[fp[v]++] = w;
+      rto[rp[w]++] = v;
+    }
+  }
+
+  // ---- 2) Kosaraju SCC（显式栈迭代，宽范围不栈溢出） ----------------------
+  // 第一趟：正图 DFS 记录完成序。
+  const seen = new Uint8Array(n);
+  const order = new Int32Array(n);
+  let orderLen = 0;
+  const nxt = new Int32Array(n);
+  const stack = new Int32Array(n);
+  for (let start = 0; start < n; start++) {
+    if (seen[start]) continue;
+    let sp = 0;
+    stack[sp++] = start;
+    seen[start] = 1;
+    nxt[start] = off[start];
+    while (sp > 0) {
+      const v = stack[sp - 1];
+      let p = nxt[v];
+      while (p < off[v + 1] && seen[to[p]]) p++;
+      if (p < off[v + 1]) {
+        const w = to[p];
+        nxt[v] = p + 1;
+        seen[w] = 1;
+        nxt[w] = off[w];
+        stack[sp++] = w;
+      } else {
+        order[orderLen++] = v;
+        sp--;
+      }
+    }
+  }
+  // 第二趟：按完成序逆序在反图 DFS，标号即 SCC。
+  const comp = new Int32Array(n).fill(-1);
+  let compCount = 0;
+  for (let oi = n - 1; oi >= 0; oi--) {
+    const root = order[oi];
+    if (comp[root] >= 0) continue;
+    const c = compCount++;
+    comp[root] = c;
+    let sp = 0;
+    stack[sp++] = root;
+    while (sp > 0) {
+      const v = stack[--sp];
+      for (let p = roff[v]; p < roff[v + 1]; p++) {
+        const w = rto[p];
+        if (comp[w] < 0) {
+          comp[w] = c;
+          stack[sp++] = w;
+        }
+      }
+    }
+  }
+
+  if (comp[S] === comp[T]) throw new Error('审计内部错误：S/T 残量互通，最大流未完成');
+
+  // ---- 3) SCC 缩点偏序 DAG（跨分量残量弧），求两类可达 --------------------
+  const coff = new Int32Array(compCount + 1);
+  for (let v = 0; v < n; v++) {
+    for (let p = off[v]; p < off[v + 1]; p++) {
+      if (comp[v] !== comp[to[p]]) coff[comp[v] + 1]++;
+    }
+  }
+  for (let c = 0; c < compCount; c++) coff[c + 1] += coff[c];
+  const cto = new Int32Array(coff[compCount]);
+  const cp = coff.slice(0, compCount);
+  for (let v = 0; v < n; v++) {
+    for (let p = off[v]; p < off[v + 1]; p++) {
+      const cv = comp[v];
+      const cw = comp[to[p]];
+      if (cv !== cw) cto[cp[cv]++] = cw;
+    }
+  }
+
+  // reachS：S 的 SCC 沿偏序可达（分量内节点在一切最小割中强制源侧）；
+  // reachT：能沿偏序到达 T 的 SCC（其中节点强制汇侧）。
+  const reachS = new Uint8Array(compCount);
+  {
+    let sp = 0;
+    stack[sp++] = comp[S];
+    reachS[comp[S]] = 1;
+    while (sp > 0) {
+      const c = stack[--sp];
+      for (let p = coff[c]; p < coff[c + 1]; p++) {
+        const d = cto[p];
+        if (!reachS[d]) {
+          reachS[d] = 1;
+          stack[sp++] = d;
+        }
+      }
+    }
+  }
+  const reachT = new Uint8Array(compCount);
+  {
+    // 缩点反图 CSR：在反图上从 T 的 SCC 反向传播，标记所有能到达 T 的 SCC。
+    const ioff = new Int32Array(compCount + 1);
+    for (let p = 0; p < coff[compCount]; p++) ioff[cto[p] + 1]++;
+    for (let c = 0; c < compCount; c++) ioff[c + 1] += ioff[c];
+    const ito = new Int32Array(coff[compCount]);
+    const ip = ioff.slice(0, compCount);
+    for (let c = 0; c < compCount; c++) {
+      for (let p = coff[c]; p < coff[c + 1]; p++) ito[ip[cto[p]]++] = c;
+    }
+    let sp = 0;
+    stack[sp++] = comp[T];
+    reachT[comp[T]] = 1;
+    while (sp > 0) {
+      const c = stack[--sp];
+      for (let p = ioff[c]; p < ioff[c + 1]; p++) {
+        const d = ito[p];
+        if (!reachT[d]) {
+          reachT[d] = 1;
+          stack[sp++] = d;
+        }
+      }
+    }
+  }
+  if (reachS[comp[T]] || reachT[comp[S]]) throw new Error('审计内部错误：残量网络存在 S→T 路径');
+
+  // ---- 4) 逐探针阈值归类，解码两端见证割并整数复算代价 --------------------
+  const directCost = (phases) => {
+    let c = 0;
+    for (const e of edges) c += e.weight * Math.abs(phases[e.v] - phases[e.u] - e.target);
+    return c;
+  };
+
+  // 自由 SCC 成员清单（跨探针），用于说明翻转时的闭包联动。
+  const freeMembers = new Map();
+  for (let i = 0; i < probes.length; i++) {
+    for (let k = probes[i].lo + 1; k <= probes[i].hi; k++) {
+      const c = comp[id(i, k)];
+      if (!reachS[c] && !reachT[c]) {
+        if (!freeMembers.has(c)) freeMembers.set(c, []);
+        freeMembers.get(c).push(`${i}@${k}`);
+      }
+    }
+  }
+
+  const minPhases = new Array(probes.length);
+  const maxPhases = new Array(probes.length);
+  const rows = probes.map((p, i) => {
+    let loK = p.lo; // 强制源侧阈值上确界（min）
+    let hiK = p.lo; // 非强制汇侧阈值上确界（max）
+    for (let k = p.lo + 1; k <= p.hi; k++) {
+      const c = comp[id(i, k)];
+      const forcedS = reachS[c] === 1;
+      const forcedT = reachT[c] === 1;
+      if (forcedS && forcedT) throw new Error('审计内部错误：阈值节点同时被强制两侧');
+      if (forcedS) {
+        if (k !== loK + 1) throw new Error('审计内部错误：强制源侧阈值不构成前缀');
+        loK = k;
+      }
+      if (!forcedT) {
+        if (k !== hiK + 1) throw new Error('审计内部错误：强制汇侧阈值不构成后缀');
+        hiK = k;
+      }
+    }
+    if (loK > hiK) throw new Error('审计内部错误：相位区间为空');
+    const min = i === reference ? 0 : loK;
+    const max = i === reference ? 0 : hiK;
+    minPhases[i] = loK;
+    maxPhases[i] = hiK;
+
+    // 可变窗口 k = min+1 … max：全部是自由 SCC 阈值。
+    const freeThresholds = [];
+    for (let k = loK + 1; k <= hiK; k++) {
+      const c = comp[id(i, k)];
+      if (reachS[c] || reachT[c]) throw new Error('审计内部错误：区间窗口内存在强制阈值');
+      freeThresholds.push({ k, comp: c, members: freeMembers.get(c) });
+    }
+    const status = i === reference ? 'reference' : min < max ? 'variable' : 'fixed';
+    return {
+      i,
+      lo: p.lo,
+      hi: p.hi,
+      phase: min, // 规范相位即最小最小割解码值（字典序最小最优解）
+      min,
+      max,
+      status,
+      // 侧判定索引：源侧阈值区间 [lo+1, min]；汇侧阈值区间 [max+1, hi]；
+      // 中间 freeThresholds 在最小见证割取汇侧、最大见证割取源侧。
+      forcedSourceUpTo: loK,
+      forcedSinkFrom: hiK + 1,
+      freeThresholds,
+    };
+  });
+
+  // 参考探针两端见证都必须为 0（钉死弧保证）。
+  minPhases[reference] = 0;
+  maxPhases[reference] = 0;
+
+  // 交叉核对：两个见证割都必须是最优赋值，代价等于本次最小割对应总代价。
+  const costMin = directCost(minPhases);
+  const costMax = directCost(maxPhases);
+  if (costMin !== costMax) {
+    throw new Error(`审计内部错误：两端见证代价不一致 ${costMin} ≠ ${costMax}`);
+  }
+
+  return {
+    ok: true,
+    cost: costMin,
+    reference,
+    sccCount: compCount,
+    witnesses: { min: { phases: minPhases }, max: { phases: maxPhases } },
+    probes: rows,
+  };
 }

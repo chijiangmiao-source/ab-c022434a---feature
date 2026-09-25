@@ -1,30 +1,54 @@
 /**
- * 求解 Worker：主线程仅做录入与渲染，最小割计算在后台进行，
+ * 求解 Worker：主线程仅做录入与渲染，最小割计算与归属审计都在后台进行，
  * 不阻塞页面交互。
  *
  * 协议（主线程 → Worker）：
  *   { type: 'solve',  id, input }  发起/替换一次复核
  *   { type: 'cancel', id, silent? } 取消当前复核；silent 时不回 canceled
+ *   { type: 'audit',  id }         对编号 id 的成功复核发起最优解归属审计
  * 协议（Worker → 主线程）：
- *   { type: 'done',     id, result }  求解结束（成功或输入校验失败）
- *   { type: 'canceled', id }          被显式取消中止
+ *   { type: 'done',       id, result } 求解结束（成功或输入校验失败）
+ *   { type: 'canceled',   id }          被显式取消中止
+ *   { type: 'audited',    id, audit }   归属审计完成
+ *   { type: 'auditStale', id }          审计代际与当前成功复核不匹配，已拒绝
  *
  * 失效策略（代际令牌）：每次 solve 生成唯一 token 并替换 activeToken；
  * 正在运行的旧计算在让出点检测到令牌易主即退出，且退出后不再回传，
  * 因而草稿修改或取消之后，旧结论绝不可能覆盖当前界面状态。
+ *
+ * 归属审计复用【同一次】成功最小割保留下来的残量网络现场
+ * （lastNetwork + lastRunId），绝不重新求解；草稿编辑、取消或新复核
+ * 都会立即清空该现场，此后旧代际的审计请求只能收到 auditStale。
  */
-import { solveAsync } from '../lib/solver.js';
+import { solveAsync, analyzeOptimalInterval } from '../lib/solver.js';
 
 let activeToken = null;
+/** 最近一次成功复核的代际编号及其残量网络现场；失效时立即置空 */
+let lastRunId = null;
+let lastNetwork = null;
 
 self.onmessage = async (ev) => {
   const msg = ev.data;
 
   if (msg.type === 'solve') {
-    const token = { id: msg.id };
-    activeToken = token;
+    // 新复核立即作废旧现场：在新一次最小割成功之前，任何旧审计都不得受理。
+    activeToken = { id: msg.id };
+    lastRunId = null;
+    lastNetwork = null;
+    const token = activeToken;
     try {
-      const result = await solveAsync(msg.input, () => activeToken !== token);
+      const result = await solveAsync(
+        msg.input,
+        () => activeToken !== token,
+        100000,
+        // 成功后把同一次最大流的残量网络现场保留下来供归属审计复用。
+        (network) => {
+          if (activeToken === token) {
+            lastNetwork = network;
+            lastRunId = msg.id;
+          }
+        },
+      );
       // 计算途中若已易主（新草稿 / 取消），直接丢弃，不得回传。
       if (activeToken !== token) return;
       activeToken = null;
@@ -32,6 +56,8 @@ self.onmessage = async (ev) => {
     } catch (err) {
       if (activeToken !== token) return;
       activeToken = null;
+      lastRunId = null;
+      lastNetwork = null;
       self.postMessage({
         type: 'done',
         id: msg.id,
@@ -49,11 +75,41 @@ self.onmessage = async (ev) => {
     return;
   }
 
+  if (msg.type === 'audit') {
+    // 只接受与当前成功复核代际精确匹配的审计请求；残量网络现场缺失
+    // （已被草稿编辑 / 取消 / 新复核作废）时拒绝，禁止重新求解凑现场。
+    if (msg.id !== lastRunId || !lastNetwork) {
+      self.postMessage({ type: 'auditStale', id: msg.id });
+      return;
+    }
+    try {
+      const audit = analyzeOptimalInterval(lastNetwork);
+      self.postMessage({ type: 'audited', id: msg.id, audit });
+    } catch (err) {
+      self.postMessage({
+        type: 'audited',
+        id: msg.id,
+        audit: {
+          ok: false,
+          errors: [
+            {
+              kind: 'internal',
+              message: `归属审计内部错误：${err && err.stack ? err.stack : String(err)}`,
+            },
+          ],
+        },
+      });
+    }
+    return;
+  }
+
   if (msg.type === 'cancel') {
     // 置空令牌使正在运行的计算在最近的让出点停止；主循环的下一条
     // solve 消息也会同样顶掉旧令牌。草稿失效类取消为 silent，
-    // 不回传以免覆盖主线程已经写好的状态。
+    // 不回传以免覆盖主线程已经写好的状态。归属审计现场同步作废。
     activeToken = null;
+    lastRunId = null;
+    lastNetwork = null;
     if (!msg.silent) self.postMessage({ type: 'canceled', id: msg.id });
   }
 };

@@ -1,12 +1,14 @@
 /**
  * 页面主控：录入探针范围与有向观测边，通过 Web Worker 发起精确复核，
- * 渲染相位面结论或定位输入错误。
+ * 渲染相位面结论或定位输入错误；复核成功后可发起最优解归属审计。
  *
  * 状态一致性：
  *  - 每次“发起复核”得到新的 runId；只有携带当前 runId 的结果允许上屏，
  *    Worker 返回的过期结果直接丢弃。
  *  - 草稿一旦修改（探针数/范围/边字段），立即作废 runId、中止 Worker 内
- *    旧计算并清除屏幕上的旧结论，保证旧计算不可能覆盖当前状态。
+ *    旧计算并清除屏幕上的旧结论与归属审计，保证旧计算不可能覆盖当前状态。
+ *  - 归属审计只对当前上屏的成功复核代际发起并接受；草稿编辑、取消或新复核
+ *    会同时作废 Worker 内的残量网络现场，代际不匹配的审计回执直接丢弃。
  */
 import './styles.css';
 import SolverWorker from '../worker/solver.worker.js?worker';
@@ -22,12 +24,14 @@ const els = {
   addEdge: $('#addEdge'),
   runBtn: $('#runBtn'),
   cancelBtn: $('#cancelBtn'),
+  auditBtn: $('#auditBtn'),
   statusLine: $('#statusLine'),
   resultPanel: $('#resultPanel'),
   errorList: $('#errorList'),
   resultBody: $('#resultBody'),
   loadSampleA: $('#loadSampleA'),
   loadSampleB: $('#loadSampleB'),
+  loadSampleC: $('#loadSampleC'),
   setAllRanges: $('#setAllRanges'),
 };
 
@@ -41,6 +45,11 @@ let edgeRows = [];
 let runId = 0;
 let worker = null;
 let computing = false;
+/** 当前上屏的成功复核结论；草稿/取消/新复核时置空，审计按钮据此启停 */
+let currentResult = null;
+/** 归属审计状态：'idle' | 'pending' | 'done' */
+let auditState = 'idle';
+let currentAudit = null;
 
 function workerEnsure() {
   if (!worker) {
@@ -49,6 +58,9 @@ function workerEnsure() {
     worker.onerror = (e) => {
       worker = null; // 允许下一次复核新建 Worker
       computing = false;
+      // Worker 崩溃后残量现场随之消失，在途审计只能作废。
+      auditState = 'idle';
+      currentAudit = null;
       refreshButtons();
       setStatus(`Worker 错误：${e.message}`, 'bad');
     };
@@ -58,7 +70,8 @@ function workerEnsure() {
 
 function onWorkerMessage(ev) {
   const msg = ev.data;
-  // 过期代际的一切回传（含 canceled）均丢弃，不允许触碰当前界面。
+  // 过期代际的一切回传（含 canceled/audited/auditStale）均丢弃，
+  // 不允许触碰当前界面。
   if (msg.id !== runId) return;
 
   if (msg.type === 'canceled') {
@@ -72,6 +85,23 @@ function onWorkerMessage(ev) {
     computing = false;
     refreshButtons();
     renderResult(msg.result);
+    return;
+  }
+
+  if (msg.type === 'auditStale') {
+    // Worker 侧残量网络现场已作废（草稿编辑/取消/新复核），审计拒绝。
+    if (auditState !== 'pending') return;
+    auditState = 'idle';
+    refreshButtons();
+    setStatus('归属审计已作废：复核代际已变更，请重新发起复核。', 'bad');
+    return;
+  }
+
+  if (msg.type === 'audited') {
+    if (auditState !== 'pending') return;
+    auditState = 'done';
+    refreshButtons();
+    renderAudit(msg.audit);
   }
 }
 
@@ -141,6 +171,9 @@ function setStatus(text, kind = '') {
 function refreshButtons() {
   els.runBtn.disabled = computing;
   els.cancelBtn.disabled = !computing;
+  // 归属审计仅在成功结论上屏、当前没有审计在途时可发起。
+  els.auditBtn.disabled = computing || !currentResult || auditState === 'pending';
+  els.auditBtn.textContent = auditState === 'pending' ? '归属审计计算中……' : '发起最优解归属审计';
 }
 
 /**
@@ -152,6 +185,10 @@ function invalidateRunning(clearPanel = true, statusText = null, silent = true) 
   runId++;
   if (worker) worker.postMessage({ type: 'cancel', id: runId, silent });
   computing = false;
+  // 草稿编辑 / 取消 / 新复核必须立即作废归属审计及其残量网络现场。
+  currentResult = null;
+  currentAudit = null;
+  auditState = 'idle';
   refreshButtons();
   if (clearPanel) {
     els.resultPanel.hidden = true;
@@ -188,6 +225,10 @@ function renderResult(result) {
 
   if (!result.ok) {
     // 输入错误：定位到具体探针/边并清除旧结论（面板只显示错误）。
+    currentResult = null;
+    currentAudit = null;
+    auditState = 'idle';
+    refreshButtons();
     els.resultBody.innerHTML = '';
     highlightErrors(result.errors);
     els.errorList.innerHTML = `
@@ -204,6 +245,11 @@ function renderResult(result) {
   }
 
   els.errorList.innerHTML = '';
+  // 新的成功结论上屏：归属审计回到未发起状态，等待校准员点击。
+  currentResult = result;
+  currentAudit = null;
+  auditState = 'idle';
+  refreshButtons();
   const ref = result.reference;
   const phasesHtml = result.phases
     .map(
@@ -256,8 +302,146 @@ function renderResult(result) {
         </tr>
       </thead>
       <tbody>${edgesHtml}</tbody>
-    </table>`;
+    </table>
+    <div id="auditMount"></div>`;
   setStatus(`复核完成：最优总代价 ${result.cost}。`, 'good');
+}
+
+// ---- 归属审计渲染 -----------------------------------------------------------
+const AUDIT_STATUS_LABEL = {
+  fixed: '固定',
+  variable: '可变',
+  reference: '参考点固定',
+};
+
+function renderAudit(audit) {
+  const mount = document.querySelector('#auditMount');
+  if (!mount) return;
+
+  if (!audit.ok) {
+    currentAudit = null;
+    mount.innerHTML = `
+      <h3>最优解归属审计</h3>
+      <div class="error-banner">归属审计未完成：${escapeHtml(
+        audit.errors?.map((e) => e.message).join('；') || '未知内部错误',
+      )}</div>`;
+    setStatus('归属审计发生内部错误。', 'bad');
+    return;
+  }
+
+  currentAudit = audit;
+  const ref = audit.reference;
+  const rowsHtml = audit.probes
+    .map((r) => {
+      const isRef = r.i === ref;
+      const single = r.min === r.max;
+      return `
+      <tr data-audit-probe="${r.i}" class="audit-row ${single ? '' : 'audit-variable'}">
+        <td class="mono">${r.i}${isRef ? ' <span class="badge">参考</span>' : ''}</td>
+        <td class="mono phase">${r.phase}</td>
+        <td class="mono">${r.min}</td>
+        <td class="mono ${single ? '' : 'warn'}">${r.max}</td>
+        <td><span class="audit-tag audit-${r.status}">${AUDIT_STATUS_LABEL[r.status]}</span></td>
+      </tr>`;
+    })
+    .join('');
+
+  mount.innerHTML = `
+    <h3>最优解归属审计（同一次最小割残量网络 · SCC 偏序）</h3>
+    <p class="hint">
+      下表给出每个探针在<strong>保持最小总代价 ${audit.cost} 不变</strong>时可取到的完整整数相位区间：
+      规范相位为字典序最小最优解；最小值取自最小最小割（S 残量可达集），
+      最大值取自最大最小割（不可达 T 的最大闭包）。点选任一探针行，
+      查看使其取到区间两端值的最小割侧判定。
+    </p>
+    <table class="grid audit-table">
+      <thead>
+        <tr>
+          <th>探针标识</th><th>规范相位</th><th>最小值</th><th>最大值</th><th>状态</th>
+        </tr>
+      </thead>
+      <tbody>${rowsHtml}</tbody>
+    </table>
+    <div id="auditDetail"></div>`;
+  setStatus(`归属审计完成：最小总代价 ${audit.cost} 下各探针相位区间已给出。`, 'good');
+
+  // 默认点选规范解所在行，便于立即查看侧判定说明。
+  const first = mount.querySelector('tr[data-audit-probe]');
+  if (first) showAuditDetail(Number(first.dataset.auditProbe));
+}
+
+/** 点选探针：列出使其取到区间最小/最大值的最小割侧判定 */
+function showAuditDetail(i) {
+  const detail = document.querySelector('#auditDetail');
+  if (!detail || !currentAudit) return;
+  const r = currentAudit.probes[i];
+  if (!r) return;
+
+  document.querySelectorAll('tr[data-audit-probe]').forEach((tr) => {
+    tr.classList.toggle('selected', Number(tr.dataset.auditProbe) === i);
+  });
+
+  const fmtRange = (a, b) => (a > b ? '（空）' : `${a}…${b}`);
+  const forcedSrc = r.lo >= r.forcedSourceUpTo ? '（空）' : `[${r.lo + 1}, ${r.forcedSourceUpTo}]`;
+  const freeWin = single ? '（空：单点区间）' : `[${r.min + 1}, ${r.max}]`;
+  const forcedSnk = r.forcedSinkFrom > r.hi ? '（空）' : `[${r.forcedSinkFrom}, ${r.hi}]`;
+
+  // 自由 SCC 的联动成员（同一强连通分量必须同时翻转）。
+  const couplingLines = [];
+  const seenComp = new Set();
+  for (const f of r.freeThresholds) {
+    if (seenComp.has(f.comp)) continue;
+    seenComp.add(f.comp);
+    const others = (f.members || []).filter((m) => m !== `${i}@${f.k}`);
+    couplingLines.push(
+      `<li>阈值节点 (探针 ${i}, k=${f.k})${
+        others.length ? ` 与 ${others.map((m) => `<code>${escapeHtml(m)}</code>`).join('、')} 同属一个自由强连通分量，取侧必须一致` : ' 独占一个自由强连通分量'
+      }；分量之间还受残量偏序闭包约束，故各探针区间须<strong>联合</strong>取值，不能逐探针独立枚举。</li>`,
+    );
+  }
+
+  const single = r.min === r.max;
+  detail.innerHTML = `
+    <div class="audit-detail">
+      <div class="audit-detail-title">
+        探针 ${i}${i === currentAudit.reference ? '（参考探针，钉死为 0）' : ''}：
+        规范相位 <span class="mono">${r.phase}</span>，
+        同成本区间 <span class="mono ${single ? '' : 'warn'}">[${r.min}, ${r.max}]</span>，
+        状态「${AUDIT_STATUS_LABEL[r.status]}」
+      </div>
+      <table class="grid audit-cutgrid">
+        <thead>
+          <tr><th>阈值 k 区间</th><th>取到最小值 ${r.min} 时的割侧</th><th>取到最大值 ${r.max} 时的割侧</th><th>判定依据（残量网络）</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="mono">k ∈ ${forcedSrc}</td>
+            <td>源侧（z=1，x≥k）</td>
+            <td>源侧（z=1，x≥k）</td>
+            <td>SCC 由源点 S 沿残量弧可达：<strong>一切</strong>最小割均强制源侧</td>
+          </tr>
+          <tr class="${single ? 'dim-row' : ''}">
+            <td class="mono">k ∈ ${freeWin}</td>
+            <td>汇侧（z=0）</td>
+            <td>源侧（z=1）</td>
+            <td>自由 SCC：S 不可达、也不可达 T，可在偏序闭包内翻转；最小最小割取汇侧，最大最小割取源侧</td>
+          </tr>
+          <tr>
+            <td class="mono">k ∈ ${forcedSnk}</td>
+            <td>汇侧（z=0）</td>
+            <td>汇侧（z=0）</td>
+            <td>SCC 沿残量弧可达汇点 T：<strong>一切</strong>最小割均强制汇侧</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="hint">
+        解码：源侧阈值的最大 k 即相位 x<sub>${i}</sub>。取最小端时仅强制源侧区间
+        <span class="mono">${forcedSrc}</span> 在源侧（窗口 ${fmtRange(r.min + 1, r.max)} 全部汇侧）⇒
+        x<sub>${i}</sub>=${r.min}；取最大端时自由窗口也翻到源侧 ⇒ x<sub>${i}</sub>=${r.max}。
+        两端割均经整数复算核对，总代价均为 ${currentAudit.cost}。
+      </p>
+      ${couplingLines.length ? `<ul class="audit-coupling">${couplingLines.join('')}</ul>` : ''}
+    </div>`;
 }
 
 function formatSigned(n) {
@@ -313,9 +497,12 @@ function runReview() {
   const input = collectInput();
   const id = ++runId;
   computing = true;
+  // 发起新复核即撤下旧结论与归属审计，避免计算期间展示过期补偿面。
+  currentResult = null;
+  currentAudit = null;
+  auditState = 'idle';
   refreshButtons();
   clearHighlights();
-  // 发起新复核即撤下旧结论，避免计算期间展示过期补偿面。
   els.resultPanel.hidden = true;
   els.resultBody.innerHTML = '';
   els.errorList.innerHTML = '';
@@ -326,6 +513,23 @@ function runReview() {
 function cancelReview() {
   invalidateRunning(true, '计算已取消，旧结论已清除。', false);
 }
+
+// ---- 发起最优解归属审计 -----------------------------------------------------
+function requestAudit() {
+  // 仅在当前成功复核上屏时可发起；Worker 侧同样校验代际与残量现场。
+  if (!currentResult || auditState === 'pending') return;
+  auditState = 'pending';
+  refreshButtons();
+  setStatus('归属审计进行中：在同一次最小割残量网络上构造 SCC 偏序……', 'pending');
+  workerEnsure().postMessage({ type: 'audit', id: runId });
+}
+
+// 审计表动态渲染，事件委托：点选探针行查看两端割侧判定。
+document.addEventListener('click', (ev) => {
+  const tr = ev.target.closest('tr[data-audit-probe]');
+  if (!tr) return;
+  showAuditDetail(Number(tr.dataset.auditProbe));
+});
 
 // ---- 样例 -------------------------------------------------------------------
 function loadSample(kind) {
@@ -345,6 +549,24 @@ function loadSample(kind) {
       { u: '0', v: '1', target: '1', weight: '10' },
       { u: '0', v: '2', target: '1', weight: '1' },
       { u: '1', v: '2', target: '1', weight: '10' },
+    ];
+  } else if (kind === 'C') {
+    // 等权闭环矛盾：三条边权重相同，闭环残差之和恒为 1，无论把唯一的
+    // 残差放在哪条边上总代价都为 1 ⇒ 存在同成本多相位面。
+    // 最优面有 (0,1,1)、(0,1,2)、(0,2,2)（字典序规范解为前者）；
+    // (0,2,1) 残差和为 3、代价 3，被最小割格偏序闭包排除。归属审计中
+    // 探针 1、2 应显示可变区间 [1,2]，探针 0（参考）为单点。
+    els.probeCount.value = '3';
+    els.referenceIdx.value = '0';
+    probeRows = [
+      { lo: '0', hi: '0' },
+      { lo: '0', hi: '3' },
+      { lo: '0', hi: '3' },
+    ];
+    edgeRows = [
+      { u: '0', v: '1', target: '1', weight: '1' },
+      { u: '1', v: '2', target: '0', weight: '1' },
+      { u: '2', v: '0', target: '-2', weight: '1' },
     ];
   } else {
     // 四环：沿生成树 0→1→2→3 局部累加得 (0,1,2,3)，违背高权闭合边，
@@ -433,8 +655,10 @@ els.setAllRanges.addEventListener('click', () => {
 
 els.runBtn.addEventListener('click', runReview);
 els.cancelBtn.addEventListener('click', cancelReview);
+els.auditBtn.addEventListener('click', requestAudit);
 els.loadSampleA.addEventListener('click', () => loadSample('A'));
 els.loadSampleB.addEventListener('click', () => loadSample('B'));
+els.loadSampleC.addEventListener('click', () => loadSample('C'));
 
 // ---- 初始状态：闭环矛盾样例 -------------------------------------------------
 loadSample('A');

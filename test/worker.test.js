@@ -3,7 +3,9 @@
  * src/worker/solver.worker.js，验证：
  *  1) 正常 solve → done，结果正确；
  *  2) 草稿替换（新 solve 顶掉旧 run）后，旧 run 的结果永不回传；
- *  3) 显式 cancel 回 canceled；silent cancel 不回执。
+ *  3) 显式 cancel 回 canceled；silent cancel 不回执；
+ *  4) 成功复核后 audit → audited，区间结论正确；
+ *  5) 草稿替换 / 取消后旧代际 audit → auditStale，绝不重新求解。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -138,5 +140,99 @@ test('Worker：显式 cancel 回执 canceled；silent cancel 不回执', async (
 
   s.post({ type: 'cancel', id: 201, silent: true });
   await s.quiet(400);
+  await s.w.terminate();
+});
+
+test('Worker：成功复核后发起归属审计返回 audited 且区间正确', async () => {
+  const s = spawnWorker();
+  s.post({ type: 'solve', id: 300, input: sampleA });
+  const done = await s.recv();
+  assert.equal(done.type, 'done');
+  assert.equal(done.id, 300);
+  assert.deepEqual(done.result.phases, [0, 1, 2]);
+
+  s.post({ type: 'audit', id: 300 });
+  const m = await s.recv();
+  assert.equal(m.type, 'audited');
+  assert.equal(m.id, 300);
+  assert.equal(m.audit.ok, true);
+  assert.equal(m.audit.cost, 1);
+  // 高权仲裁样例唯一最优：除参考点外全部单点固定。
+  assert.ok(m.audit.probes.every((r) => r.min === r.max));
+  assert.equal(m.audit.probes[0].status, 'reference');
+  assert.equal(m.audit.probes[1].status, 'fixed');
+  assert.equal(m.audit.probes[2].status, 'fixed');
+  await s.w.terminate();
+});
+
+test('Worker：等权矛盾环审计观察到可变区间与联动见证', async () => {
+  const tieCycle = {
+    probes: [{ lo: 0, hi: 0 }, { lo: 0, hi: 3 }, { lo: 0, hi: 3 }],
+    edges: [
+      { u: 0, v: 1, target: 1, weight: 1 },
+      { u: 1, v: 2, target: 0, weight: 1 },
+      { u: 2, v: 0, target: -2, weight: 1 },
+    ],
+    reference: 0,
+  };
+  const s = spawnWorker();
+  s.post({ type: 'solve', id: 301, input: tieCycle });
+  assert.equal((await s.recv()).type, 'done');
+  s.post({ type: 'audit', id: 301 });
+  const m = await s.recv();
+  assert.equal(m.type, 'audited');
+  assert.deepEqual(
+    m.audit.probes.map((r) => [r.min, r.max, r.status]),
+    [
+      [0, 0, 'reference'],
+      [1, 2, 'variable'],
+      [1, 2, 'variable'],
+    ],
+  );
+  assert.deepEqual(m.audit.witnesses.min.phases, [0, 1, 1]);
+  assert.deepEqual(m.audit.witnesses.max.phases, [0, 2, 2]);
+  await s.w.terminate();
+});
+
+test('Worker：新复核顶掉旧现场后，旧代际审计回 auditStale 且不重算', async () => {
+  const s = spawnWorker();
+  s.post({ type: 'solve', id: 400, input: sampleA });
+  assert.equal((await s.recv()).type, 'done');
+
+  // 草稿编辑/新复核立即作废残量现场。
+  s.post({ type: 'solve', id: 401, input: sampleA });
+  assert.equal((await s.recv()).type, 'done');
+
+  // 旧代际 400 的审计必须被拒绝。
+  s.post({ type: 'audit', id: 400 });
+  const stale = await s.recv();
+  assert.deepEqual(stale, { type: 'auditStale', id: 400 });
+
+  // 当前代际 401 的审计正常受理。
+  s.post({ type: 'audit', id: 401 });
+  const m = await s.recv();
+  assert.equal(m.type, 'audited');
+  assert.equal(m.id, 401);
+  await s.w.terminate();
+});
+
+test('Worker：取消后审计因代际现场缺失回 auditStale', async () => {
+  const s = spawnWorker();
+  s.post({ type: 'solve', id: 500, input: sampleA });
+  assert.equal((await s.recv()).type, 'done');
+  s.post({ type: 'cancel', id: 500, silent: true });
+  // 给事件循环一点时间处理取消。
+  await new Promise((r) => setTimeout(r, 50));
+  s.post({ type: 'audit', id: 500 });
+  const m = await s.recv();
+  assert.deepEqual(m, { type: 'auditStale', id: 500 });
+  await s.w.terminate();
+});
+
+test('Worker：审计只认当前成功复核代际——从未成功过的 id 回 auditStale', async () => {
+  const s = spawnWorker();
+  s.post({ type: 'audit', id: 999 });
+  const m = await s.recv();
+  assert.deepEqual(m, { type: 'auditStale', id: 999 });
   await s.w.terminate();
 });
