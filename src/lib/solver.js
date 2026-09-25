@@ -256,14 +256,27 @@ function decodeResult(probes, edges, reference, dinic, id, S, T, flow) {
  * @param {(() => boolean)|null} [shouldCancel] 协作式取消。
  */
 export function solve(input, shouldCancel = null) {
+  return solveWithResidual(input, shouldCancel).result;
+}
+
+/**
+ * 同步求解并保留残量网络：返回的 residual 携最大流完成后的
+ * Dinic 残量与节点编号映射，供最优解归属审计在同一网络上
+ * 构造最小割格（不得重跑求解）。失败/取消时 residual 为 null。
+ */
+export function solveWithResidual(input, shouldCancel = null) {
   const errors = validateInput(input);
-  if (errors.length) return { ok: false, errors };
+  if (errors.length) return { result: { ok: false, errors }, residual: null };
 
   const { probes, edges, reference } = input;
   const built = buildNetwork(probes, edges, reference);
   const flow = built.dinic.maxflow(built.S, built.T, shouldCancel);
-  if (shouldCancel && shouldCancel()) return { ok: false, canceled: true };
-  return decodeResult(probes, edges, reference, built.dinic, built.id, built.S, built.T, flow);
+  if (shouldCancel && shouldCancel()) return { result: { ok: false, canceled: true }, residual: null };
+  const result = decodeResult(probes, edges, reference, built.dinic, built.id, built.S, built.T, flow);
+  return {
+    result,
+    residual: { probes, reference, dinic: built.dinic, id: built.id, S: built.S, T: built.T },
+  };
 }
 
 /**
@@ -271,12 +284,21 @@ export function solve(input, shouldCancel = null) {
  * 使“取消 / 草稿已变更”能及时生效；返回 canceled 时调用方必须丢弃结果。
  */
 export async function solveAsync(input, shouldCancel = null, yieldEvery = 100000) {
+  return (await solveAsyncWithResidual(input, shouldCancel, yieldEvery)).result;
+}
+
+/** 异步版 solveWithResidual：Worker 复核成功后保留残量网络供归属审计复用。 */
+export async function solveAsyncWithResidual(input, shouldCancel = null, yieldEvery = 100000) {
   const errors = validateInput(input);
-  if (errors.length) return { ok: false, errors };
+  if (errors.length) return { result: { ok: false, errors }, residual: null };
 
   const { probes, edges, reference } = input;
   const built = buildNetwork(probes, edges, reference);
   const flow = await built.dinic.maxflowAsync(built.S, built.T, shouldCancel, yieldEvery);
-  if (shouldCancel && shouldCancel()) return { ok: false, canceled: true };
-  return decodeResult(probes, edges, reference, built.dinic, built.id, built.S, built.T, flow);
+  if (shouldCancel && shouldCancel()) return { result: { ok: false, canceled: true }, residual: null };
+  const result = decodeResult(probes, edges, reference, built.dinic, built.id, built.S, built.T, flow);
+  return {
+    result,
+    residual: { probes, reference, dinic: built.dinic, id: built.id, S: built.S, T: built.T },
+  };
 }
